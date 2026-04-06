@@ -1,3 +1,9 @@
+# 프로젝트 내부 문서 (git 추적 제외)
+기획/
+문서/
+계획.md
+data/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
