@@ -1,0 +1,14 @@
+data:
+  input_dir: "data/input"
+  frames_dir: "output/frames"
+  sfm_dir: "output/sfm"
+  reconstruction_dir: "output/reconstruction"
+  splat_dir: "output/splat"
+
+# 기초 모델
+colmap:
+  binary_path: "colmap"
+
+gaussian_splatting:
+  iteration: 30000
+  learning_rate: 0.001
