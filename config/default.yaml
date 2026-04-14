@@ -1,9 +1,19 @@
 data:
-  input_dir: "data/input"
+  input_dir: "data"
   frames_dir: "output/frames"
   sfm_dir: "output/sfm"
   reconstruction_dir: "output/reconstruction"
   splat_dir: "output/splat"
+
+#frame_extract
+frame_extract:
+  target_frames: 300
+  blur_keep_ratio: 0.8
+  blur_chunk_count: 10
+  blur_min_per_chunk: 3
+  resize_long_side: 1600
+  output_format: "jpg"
+  jpg_quality: 95
 
 # 기초 모델
 colmap:

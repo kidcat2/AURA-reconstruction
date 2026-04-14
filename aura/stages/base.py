@@ -7,5 +7,9 @@ class BaseStage(ABC):
     context : 이전 Stage의 결과물
     """
     @abstractmethod
-    def run(self, config, context):
+    def __init__(self, config):
+        pass
+    
+    @abstractmethod
+    def run(self, context):
         pass

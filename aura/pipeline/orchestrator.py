@@ -14,6 +14,6 @@ class Orchestrator:
             context = {}
 
             for stage_name in stages:
-                stage = STAGE[stage_name]()
-                stage.run(config, context)
+                stage = STAGE[stage_name](config)
+                stage.run(context)
         
