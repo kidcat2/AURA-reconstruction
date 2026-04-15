@@ -18,8 +18,6 @@ import numpy as np
 
 """
 
-
-
 class FrameExtract(BaseStage):
 
     def __init__(self, config):
@@ -40,14 +38,14 @@ class FrameExtract(BaseStage):
         self.video_count = 0
 
     def run(self, context):
-        print("[FrameExtract] 실행")
+        print("FrameExtract start")
         
         self.sampling()
         self.make_context(context)
     
     def sampling(self):
 
-        video_paths = glob.glob(f"{self.input_dir}/*.mp4")
+        video_paths = sorted(glob.glob(f"{self.input_dir}/*.mp4"))
         self.video_count = len(video_paths)
 
         for i, video_path in enumerate(video_paths):
@@ -102,7 +100,12 @@ class FrameExtract(BaseStage):
             batch = [(i + j, s) for j, s in enumerate(value)]
 
             batch.sort(key=lambda x : x[1], reverse=True)
-            batch = batch[:int(self.blur_chunk_cnt * self.blur_keep_ratio)]
+
+            if len(batch) <= self.blur_chunk_min:
+                batch = batch[:self.blur_chunk_min]
+            else:
+                batch = batch[:int(self.blur_chunk_cnt * self.blur_keep_ratio)]
+
             batch.sort(key=lambda x : x[0])
 
             keep_indices.extend([x[0] for x in batch])
@@ -130,7 +133,7 @@ class FrameExtract(BaseStage):
             filename = f"{i:05d}.{self.output_format}"
             path = os.path.join(output_dir, filename)
 
-            cv2.imwrite(path, frame)
+            cv2.imwrite(path, frame, [cv2.IMWRITE_JPEG_QUALITY, self.jpg_quality])
 
 
     def make_context(self, context):

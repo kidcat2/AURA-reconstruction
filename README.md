@@ -75,11 +75,13 @@ AURA-reconstruction/
 - 경로, 파라미터 등 설정값
 
 ### data/
+- 입력 영상 (.mp4)
+
+### output/ (자동 생성)
 ```
-data/
-├── input/          # 입력 영상
-├── frames/         # 추출된 프레임 이미지
-├── sfm/            # SfM 결과
+output/
+├── frames/         # 추출된 프레임 이미지 (video_000/, video_001/, ...)
+├── sfm/            # SfM 결과 (database.db, sparse/)
 ├── reconstruction/ # 3DGS 학습 출력 (.ply)
-└── output/         # 최종 결과물 (.splat)
+└── splat/          # 최종 결과물 (.splat)
 ```

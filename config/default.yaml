@@ -15,10 +15,6 @@ frame_extract:
   output_format: "jpg"
   jpg_quality: 95
 
-# 기초 모델
-colmap:
-  binary_path: "colmap"
-
 gaussian_splatting:
   iteration: 30000
   learning_rate: 0.001
