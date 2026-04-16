@@ -15,6 +15,7 @@ frame_extract:
   output_format: "jpg"
   jpg_quality: 95
 
+#gaussian
 gaussian_splatting:
   iteration: 30000
   learning_rate: 0.001
