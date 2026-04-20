@@ -19,3 +19,6 @@ frame_extract:
 gaussian_splatting:
   iteration: 30000
   learning_rate: 0.001
+  near: 0.01
+  far: 100.0
+  
