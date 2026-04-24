@@ -71,6 +71,7 @@ class GaussianSplatting(BaseStage):
 
         self.near_plane = config["gaussian_splatting"]["near"]
         self.far_plane = config["gaussian_splatting"]["far"]
+        self.tile_size = config["gaussian_splatting"]["tile_size"]
 
     def run(self, context):
         print("[GaussianSplatting] 실행")
@@ -91,7 +92,7 @@ class GaussianSplatting(BaseStage):
         # scale 
         tree = KDTree(xyz)
         dist, _ = tree.query(xyz, k=4)
-        scale = dist[:, 1:].mean(axis=1, keepdims=True).repeat(3, axis=1)
+        scale = dist[:, 1:].mean(axis=1, keepdims=True).repeat(3, axis=1) 
 
         # quaternion
         q = np.zeros((N, 4))
@@ -136,10 +137,10 @@ class GaussianSplatting(BaseStage):
 
                 # View, Proj Matrix
                 V = self.build_view(image)
-                P, fov = self.build_proj(camera)
+                P, cam_data = self.build_proj(camera)
 
                 # Tile Rasterization
-                self.rasterization(gaussians, V, P, fov)
+                self.tile_rasterization(gaussians, V, P, cam_data)
 
                 # Loss
 
@@ -151,12 +152,15 @@ class GaussianSplatting(BaseStage):
 
                 
 
-    def rasterization(self, gaussians, view, proj, fov):
-        gaussians, mask = self.cull_gaussian(gaussians, view, fov)
+    def tile_rasterization(self, gaussians, view, proj, cam_data):
 
-    def cull_gaussian(self, gaussians, view, fov):
+        ### 1. Cull Gaussian
+        fx, fy, cx, cy, cw, ch = cam_data # 초점거리, 주점, 이미지 크기
 
-        fov_x, fov_y = fov
+        # 시야각
+        fov_x = 2 * math.atan(cw / (2 * fx))
+        fov_y = 2 * math.atan(ch / (2 * fy))
+
         tan_half_fov_x = math.tan(fov_x / 2)
         tan_half_fov_y = math.tan(fov_y / 2)
         
@@ -176,38 +180,124 @@ class GaussianSplatting(BaseStage):
             (torch.abs(y / z) < tan_half_fov_y)
         )
         
-        return gaussians[in_frustum], in_frustum
+        gaussians = gaussians[in_frustum]
+        cam_xyz = cam_xyz[in_frustum]
+
+        ### 2. Screen space
+        
+        ## 카메라 좌표 > Projection > divide w > NDC > 픽셀 좌표
+        clip_xyz = cam_xyz @ proj.T # [N' X 4] [4 X 4] [4 X 4] = [N X 4]
+        ndc = clip_xyz / clip_xyz[:, 3:4]
+        pixel_x = (ndc[:, 0] + 1) * 0.5 * cw # N, 1
+        pixel_y = (ndc[:, 1] + 1) * 0.5 * ch # N, 1
+        depth = cam_xyz[:,2]
+
+        ## cov 3d > cov 2d
+        S = gaussians[:, 3:6]
+        Q = gaussians[:, 6:10]
+        
+        S = torch.diag_embed(S) # N' X 3 X 3
+        R = self.q2rot(Q) # N' X 3 X 3
+        W = view[:3, :3] # 3 X 3
+        J = self.jacobian(cam_xyz[in_frustum], fx, fy)
+        
+        cov = R @ S @ S.transpose(-1, -2) @ R.transpose(-1, -2)
+        cov_2d = J @ W @ cov @ W.T @ J.transpose(-1, -2) # N X 2 x 2
+
+        cov_2d[:, 0, 0] += 0.3
+        cov_2d[:, 1, 1] += 0.3
+
+        ## 고유값 closed-form ( = 가우시안 타원 장축)
+        mid = 0.5 * (cov_2d[:, 0,0] + cov_2d[:, 1,1])
+        det = cov_2d[:, 0,0] * cov_2d[:, 1,1] - (cov_2d[:, 0,1] ** 2)
+        eigen_value = mid + torch.sqrt(torch.clamp(mid**2 - det, min=0.1))
+        radius = 3.0 * torch.sqrt(eigen_value) # (N',)
+
+        ## bounding box
+        min_tile_x = torch.floor((pixel_x - radius) / self.tile_size).to(torch.int64) # min[a,] : a번 가우시안의 bounding box의 작은 x값 좌표
+        min_tile_y = torch.floor((pixel_y - radius) / self.tile_size).to(torch.int64)
+        max_tile_x = torch.floor((pixel_x + radius) / self.tile_size).to(torch.int64)
+        max_tile_y = torch.floor((pixel_y + radius) / self.tile_size).to(torch.int64)
+
+        grid_w = (cw + self.tile_size - 1) // self.tile_size
+        grid_h = (ch + self.tile_size - 1) // self.tile_size
+
+        box_w = max_tile_x - min_tile_x + 1
+        box_h = max_tile_y - min_tile_y + 1
+
+        ### 3. Create Tile
+        counts = box_w * box_h # counts[i] = j , i : 가우시안 번호, j : 가우시안 i가 속한 타일의 수
+        offsets = torch.cumsum(counts, dim=0) - counts # offset[i] = j,   i : 가우시안 번호 (0~N), j : 가우시안 i의 시작 인덱스(누적합)
+        M = counts[-1] + offsets[-1] # Key 배열의 크기 
+
+        keys = torch.empty(M, dtype=torch.int64)        
+        
+        slot = torch.arange(M, device=offsets.device, dtype=torch.int64) # 전체 엔트리 슬롯 인덱스 [0, M)
+        values = torch.searchsorted(offsets, slot, right=True) - 1 # values[i] = j,  i : 슬롯 인덱스,  j : 가우시안 번호
+
+        # fancy indexing
+        k = slot - offsets[values] # k[i] = j,  i : 슬롯 인덱스 , j : 타일 순번
+        bw = box_w[values]
+
+        tile_x = min_tile_x[values] + k % bw
+        tile_y = min_tile_y[values] + k // bw
+        tile_num = tile_y * grid_w + tile_x
+        
+        # depth는 float(32비트) 이므로, 32비트 그대로 int로 변환 후 상위 비트 0으로  
+        depth_int = depth[values].view(torch.int32).to(torch.int64) & 0xFFFFFFFF 
+
+        keys = (tile_num.to(torch.int64) << 32) | depth_int
+        
+        # searchsorted(a,b) : b값이 정렬된 배열 a에서 어느 index에 들어가야 배열 a가 여전히 정렬된 상태를 유지하는지. (right : 값이 같은 경우 오른쪽, 왼쪽 결정)
+
+
+        
+
+        ### 4. DuplicateWithKey
+
+        ### 5. SortByKey
+        ### 6. IdentifyTileRanges
+        ### 7. GetTileRange
+        ### 8. BlendInOrder
     
+    def jacobian(self, cam_xyz, fx, fy):
+        x, y, z = cam_xyz[:, :3].unbind(-1)
+        zero = torch.zeros_like(z)
+
+        jacobian = torch.stack([
+            torch.stack([fx/z, zero, (-fx * x) / z**2], dim=-1),
+            torch.stack([zero, fy/z, (-fy * y) / z**2], dim=-1),
+        ], dim=-2)
+
+        return jacobian
+
+
     # Quaternion > Rotation Matrix
     def q2rot(self, q):
-        q = q / np.linalg.norm(q)
-        qw, qx, qy, qz = q
+        q = q / q.norm(dim=-1, keepdim=True)
+        qw, qx, qy, qz = q.unbind(-1)
 
-        rot = np.array([
-            [1 - 2*(qy**2 + qz**2),  2*(qx*qy - qz*qw),      2*(qx*qz + qy*qw)],
-            [2*(qx*qy + qz*qw),      1 - 2*(qx**2 + qz**2),  2*(qy*qz - qx*qw)],
-            [2*(qx*qz - qy*qw),      2*(qy*qz + qx*qw),      1 - 2*(qx**2 + qy**2)]
-        ])
+        rot = torch.stack([
+            torch.stack([1 - 2*(qy**2 + qz**2),  2*(qx*qy - qz*qw),      2*(qx*qz + qy*qw)],      dim=-1),
+            torch.stack([2*(qx*qy + qz*qw),      1 - 2*(qx**2 + qz**2),  2*(qy*qz - qx*qw)],      dim=-1),
+            torch.stack([2*(qx*qz - qy*qw),      2*(qy*qz + qx*qw),      1 - 2*(qx**2 + qy**2)],  dim=-1),
+        ], dim=-2)
 
         return rot
     
     def build_view(self, image):
-        R = self.q2rot(np.array(image.qvec))
-        T = np.array(image.tvec, dtype=np.float32)
+        R = self.q2rot(torch.tensor(image.qvec, dtype=torch.float32, device='cuda').unsqueeze(0))[0]
+        T = torch.tensor(image.tvec, dtype=torch.float32, device='cuda')
         
-        V = np.eye(4, dtype=np.float32)
+        V = torch.eye(4, dtype=torch.float32, device='cuda')
         V[:3, :3] = R
         V[:3, 3] = T
         
-        return torch.tensor(V, dtype=torch.float32).cuda().requires_grad_(False)
+        return V.requires_grad_(False)
 
     def build_proj(self, camera):
         fx, fy, cx, cy = camera.params
         camera_w, camera_h = camera.width, camera.height
-
-        # FOV 
-        fov_x = 2 * math.atan(camera_w / (2 * fx))
-        fov_y = 2 * math.atan(camera_h / (2 * fy))
 
         # Projection Matrix
         P = torch.tensor([
@@ -217,7 +307,7 @@ class GaussianSplatting(BaseStage):
             [     0,      0,  1,                        0]
         ], dtype=torch.float32).cuda().requires_grad_(False)
 
-        return P, [fov_x, fov_y]
+        return P, [fx, fy, cx, cy, camera_w, camera_h]
 
     
         

@@ -21,4 +21,5 @@ gaussian_splatting:
   learning_rate: 0.001
   near: 0.01
   far: 100.0
+  tile_size: 16
   
