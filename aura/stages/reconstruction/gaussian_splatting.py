@@ -8,6 +8,7 @@ import numpy as np
 from sklearn.neighbors import KDTree # 최근접 이웃탐색
 import cv2
 import torch
+import torch.nn.functional as F
 import math
 
 # 1. config default 수정 (iteration, learning rate 등)
@@ -62,6 +63,29 @@ Q.
 3. Proj Matrix의 구성
 4. 구면조화 함수 이해하기
 """
+
+SH_C0 = 0.28209479177387814
+
+SH_C1 = 0.4886025119029199
+
+SH_C2 = [
+    1.0925484305920792,
+   -1.0925484305920792,
+    0.31539156525252005,
+   -1.0925484305920792,
+    0.5462742152960396,
+]
+
+SH_C3 = [
+   -0.5900435899266435,
+    2.890611442640554,
+   -0.4570457994644658,
+    0.3731763325901154,
+   -0.4570457994644658,
+    1.445305721320277,
+   -0.5900435899266435,
+]
+
 class GaussianSplatting(BaseStage):
 
     def __init__(self, config):
@@ -98,7 +122,7 @@ class GaussianSplatting(BaseStage):
         q = np.zeros((N, 4))
         q[:, 0] = 1.0
 
-        # alpah 
+        # alpha 
         alpha = np.full((N, 1), 0.5)
 
         # color
@@ -120,9 +144,10 @@ class GaussianSplatting(BaseStage):
 
         for video_idx, video_dir in enumerate(video_dirs):
             recon = pycolmap.Reconstruction(video_dir)
-            gaussians = self.init_gaussian(recon.points3D)
-
             image_ids = sorted(recon.images.keys())
+
+            gaussians = self.init_gaussian(recon.points3D)
+            optimizer = torch.optim.Adam([gaussians], lr=self.lr)
 
             for _ in range(self.iter):
                 
@@ -133,6 +158,7 @@ class GaussianSplatting(BaseStage):
                 
                 # gt
                 gt = cv2.imread(f"{self.image_dir}/video_{video_idx:03d}/{image.name}")
+                gt = cv2.cvtColor(gt, cv2.COLOR_BGR2RGB)
                 gt = torch.tensor(gt, dtype=torch.float32).cuda() / 255.0
 
                 # View, Proj Matrix
@@ -140,17 +166,17 @@ class GaussianSplatting(BaseStage):
                 P, cam_data = self.build_proj(camera)
 
                 # Tile Rasterization
-                self.tile_rasterization(gaussians, V, P, cam_data)
+                out = self.tile_rasterization(gaussians, V, P, cam_data)
 
                 # Loss
+                loss = torch.abs(out - gt).mean()
 
                 # Adam
-
-                # Gaussian Refinement
-
-            
-
+                loss.backward()
+                optimizer.step()
+                optimizer.zero_grad()
                 
+                # Gaussian Refinement
 
     def tile_rasterization(self, gaussians, view, proj, cam_data):
 
@@ -199,7 +225,7 @@ class GaussianSplatting(BaseStage):
         S = torch.diag_embed(S) # N' X 3 X 3
         R = self.q2rot(Q) # N' X 3 X 3
         W = view[:3, :3] # 3 X 3
-        J = self.jacobian(cam_xyz[in_frustum], fx, fy)
+        J = self.jacobian(cam_xyz, fx, fy)
         
         cov = R @ S @ S.transpose(-1, -2) @ R.transpose(-1, -2)
         cov_2d = J @ W @ cov @ W.T @ J.transpose(-1, -2) # N X 2 x 2
@@ -207,35 +233,63 @@ class GaussianSplatting(BaseStage):
         cov_2d[:, 0, 0] += 0.3
         cov_2d[:, 1, 1] += 0.3
 
-        ## 고유값 closed-form ( = 가우시안 타원 장축)
+        
+        ## 고유값 
         mid = 0.5 * (cov_2d[:, 0,0] + cov_2d[:, 1,1])
         det = cov_2d[:, 0,0] * cov_2d[:, 1,1] - (cov_2d[:, 0,1] ** 2)
+        det = det.clamp(min=1e-7)
         eigen_value = mid + torch.sqrt(torch.clamp(mid**2 - det, min=0.1))
         radius = 3.0 * torch.sqrt(eigen_value) # (N',)
 
-        ## bounding box
+        # 역행렬
+        inverse_cov2d = torch.stack([
+            torch.stack([cov_2d[:, 1, 1] / det, -cov_2d[:, 0, 1] / det], dim=1),
+            torch.stack([-cov_2d[:, 0, 1] / det, cov_2d[:, 0, 0] / det], dim=1),
+        ], dim=-2)
+
+        # 변수 정리
+        opacity = torch.sigmoid(gaussians[:, 10]) #  alpha
+        mu = torch.stack([pixel_x, pixel_y], dim=-1) # mean
+        
+        # SH
+        f_dc = gaussians[:, 11:14].view(-1, 1, 3) # [N', 3] --> [N', 1, 3]
+        f_rest = gaussians[:, 14:59].view(-1, 15, 3) # [N', 3] --> [N', 15, 3]
+        sh = torch.cat([f_dc, f_rest], dim=1) # [N', 16, 3]
+
+        # camera pos, direction
+        cam_pos = -view[:3, :3].T @ view[:3, 3] # [3,]
+        dir = xyz - cam_pos[None, :] # [N', 3]
+        dir = F.normalize(dir, dim=-1)
+
+        color = self.eval_sh(sh, dir)
+
+        ### 3. Create Tile
+
+        ## gaussian bounding box
         min_tile_x = torch.floor((pixel_x - radius) / self.tile_size).to(torch.int64) # min[a,] : a번 가우시안의 bounding box의 작은 x값 좌표
         min_tile_y = torch.floor((pixel_y - radius) / self.tile_size).to(torch.int64)
         max_tile_x = torch.floor((pixel_x + radius) / self.tile_size).to(torch.int64)
         max_tile_y = torch.floor((pixel_y + radius) / self.tile_size).to(torch.int64)
-
+        
+        ## tile grid
         grid_w = (cw + self.tile_size - 1) // self.tile_size
         grid_h = (ch + self.tile_size - 1) // self.tile_size
 
         box_w = max_tile_x - min_tile_x + 1
         box_h = max_tile_y - min_tile_y + 1
-
-        ### 3. Create Tile
-        counts = box_w * box_h # counts[i] = j , i : 가우시안 번호, j : 가우시안 i가 속한 타일의 수
-        offsets = torch.cumsum(counts, dim=0) - counts # offset[i] = j,   i : 가우시안 번호 (0~N), j : 가우시안 i의 시작 인덱스(누적합)
-        M = counts[-1] + offsets[-1] # Key 배열의 크기 
-
-        keys = torch.empty(M, dtype=torch.int64)        
         
+        ### 4. DuplicateWithKey
+
+        # counts[i] = j , i : 가우시안 번호, j : 가우시안 i가 속한 타일의 수
+        # offset[i] = j,   i : 가우시안 번호 (0~N), j : 가우시안 i의 시작 인덱스(누적합)
+        counts = box_w * box_h 
+        offsets = torch.cumsum(counts, dim=0) - counts 
+        M = int(counts[-1] + offsets[-1]) # Key 배열의 크기 
+
         slot = torch.arange(M, device=offsets.device, dtype=torch.int64) # 전체 엔트리 슬롯 인덱스 [0, M)
         values = torch.searchsorted(offsets, slot, right=True) - 1 # values[i] = j,  i : 슬롯 인덱스,  j : 가우시안 번호
+        # searchsorted(a,b) : b값이 정렬된 배열 a에서 어느 index에 들어가야 배열 a가 여전히 정렬된 상태를 유지하는지. (right : 값이 같은 경우 오른쪽, 왼쪽 결정)
 
-        # fancy indexing
         k = slot - offsets[values] # k[i] = j,  i : 슬롯 인덱스 , j : 타일 순번
         bw = box_w[values]
 
@@ -243,22 +297,100 @@ class GaussianSplatting(BaseStage):
         tile_y = min_tile_y[values] + k // bw
         tile_num = tile_y * grid_w + tile_x
         
-        # depth는 float(32비트) 이므로, 32비트 그대로 int로 변환 후 상위 비트 0으로  
+        # depth float bit 
         depth_int = depth[values].view(torch.int32).to(torch.int64) & 0xFFFFFFFF 
-
-        keys = (tile_num.to(torch.int64) << 32) | depth_int
+        keys = (tile_num.to(torch.int64) << 32) | depth_int # [M, ]
         
-        # searchsorted(a,b) : b값이 정렬된 배열 a에서 어느 index에 들어가야 배열 a가 여전히 정렬된 상태를 유지하는지. (right : 값이 같은 경우 오른쪽, 왼쪽 결정)
-
-
-        
-
-        ### 4. DuplicateWithKey
-
         ### 5. SortByKey
+        sorted_keys, key_idx = torch.sort(keys)
+        sorted_values = values[key_idx]
+
         ### 6. IdentifyTileRanges
+        T = grid_w * grid_h
+        tile_boundary = torch.arange(T+1, device=sorted_keys.device, dtype=torch.int64) << 32
+        tile_range = torch.searchsorted(sorted_keys, tile_boundary)
+
+        tile_start = tile_range[:-1] # [i] = j , i번째 타일의 시작인덱스 j
+        tile_end = tile_range[1:]
+
         ### 7. GetTileRange
-        ### 8. BlendInOrder
+        out = torch.zeros((int(ch), int(cw), 3), device=torch.device('cuda'))
+
+        for t in range(T):
+            start_pw = t % grid_w
+            start_ph = t // grid_w
+            
+            px_start = start_pw * self.tile_size
+            py_start = start_ph * self.tile_size
+            px_end = min((start_pw + 1) * self.tile_size, cw)
+            py_end = min((start_ph + 1) * self.tile_size, ch)
+
+            px = torch.arange(px_start, px_end, device=torch.device('cuda'))
+            py = torch.arange(py_start, py_end, device=torch.device('cuda'))
+
+            PY, PX = torch.meshgrid(py, px, indexing='ij')
+            pixels = torch.stack([PX, PY], dim=-1).reshape(-1, 2) # [256, 2]
+
+            # g_t : 현재 타일 t에 쓰일 가우시안들의 번호를 depth를 기준으로 정렬한 배열
+            G_t = sorted_values[tile_start[t]:tile_end[t]] # [G,]
+            inverse_cov2d_t = inverse_cov2d[G_t] # [G, 2, 2]
+            opacity_t = opacity[G_t] # [G,]
+            color_t = color[G_t] # [G,3]
+            mu_t = mu[G_t] # [G,2]
+
+            ### 8. BlendInOrder
+
+            # gaussian alpha
+            ## alpha = alpha * (x-m)^T * cov * (x-m)
+            ## d = x-m
+            d = pixels[:, None, :] - mu_t[None, :, :]  # [256, G, 2]
+
+            power = torch.einsum('pgi,gij,pgj->pg', d, inverse_cov2d_t, d) # [P,G]
+            alpha_t = opacity_t * torch.exp(-0.5 * power)
+            alpha_t = alpha_t.clamp(max=0.99)
+
+            # gaussian alpha blending
+            # color = sum(T * a * c)
+
+            one_minus_alpha = 1 - alpha_t # [P,G]
+            T_inclusive = torch.cumprod(one_minus_alpha, dim=1) # [P,G]
+            T_acc = torch.cat([torch.ones_like(T_inclusive[:, :1]), T_inclusive[:, :-1]], dim=1) # [P,G]
+            contrib = T_acc * alpha_t # [P,G]
+            
+            c = (contrib[:, :, None] * color_t[None, :, :]).sum(dim=1) # [P,G,3] -> [P,3]
+            c_2d = c.reshape(py_end - py_start, px_end - px_start, 3)
+            out[py_start:py_end, px_start:px_end] = c_2d
+
+        return out
+            
+    def eval_sh(self, sh, dir):
+        
+        dir_x, dir_y, dir_z = dir[:, 0:1], dir[:, 1:2], dir[:, 2:3]
+
+        result = SH_C0 * sh[:, 0]
+
+        result += -SH_C1 * dir_y * sh[:, 1]
+        result += SH_C1 * dir_z * sh[:, 2]
+        result += -SH_C1 * dir_x * sh[:, 3]
+
+        dir_xx, dir_yy, dir_zz = dir_x ** 2, dir_y ** 2, dir_z ** 2
+        dir_xy, dir_yz, dir_xz = dir_x * dir_y, dir_y * dir_z, dir_x * dir_z
+
+        result += SH_C2[0] * dir_xy * sh[:, 4]
+        result += SH_C2[1] * dir_yz * sh[:, 5]
+        result += SH_C2[2] * (3*dir_zz - 1) * sh[:, 6]
+        result += SH_C2[3] * dir_xz * sh[:, 7]
+        result += SH_C2[4] * (dir_xx - dir_yy) * sh[:, 8]
+
+        result += SH_C3[0] * dir_y * (3*dir_xx - dir_yy) * sh[:, 9]
+        result += SH_C3[1] * dir_xy * dir_z * sh[:, 10]
+        result += SH_C3[2] * dir_y * (5*dir_zz - 1) * sh[:, 11]
+        result += SH_C3[3] * dir_z * (5*dir_zz - 3) * sh[:, 12]
+        result += SH_C3[4] * dir_x * (5*dir_zz - 1) * sh[:, 13]
+        result += SH_C3[5] * dir_z * (dir_xx - dir_yy) * sh[:, 14]
+        result += SH_C3[6] * dir_x * (dir_xx - 3*dir_yy) * sh[:, 15]
+
+        return (result + 0.5).clamp(min=0)
     
     def jacobian(self, cam_xyz, fx, fy):
         x, y, z = cam_xyz[:, :3].unbind(-1)
