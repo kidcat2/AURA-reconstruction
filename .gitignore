@@ -4,6 +4,10 @@
 계획.md
 작업일지.md
 이론.md
+문제해결.md
+
+# COLMAP 실행파일
+colmap/
 data/
 output/
 

@@ -3,7 +3,7 @@ data:
   frames_dir: "output/frames"
   sfm_dir: "output/sfm"
   reconstruction_dir: "output/reconstruction"
-  splat_dir: "output/splat"
+  ply_dir: "output/ply"
 
 #frame_extract
 frame_extract:
@@ -17,7 +17,7 @@ frame_extract:
 
 #gaussian
 gaussian_splatting:
-  iteration: 30000
+  iteration: 3000
   learning_rate: 0.001
   near: 0.01
   far: 100.0

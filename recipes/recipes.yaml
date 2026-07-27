@@ -1,6 +1,6 @@
 colmap_3dgs:
   stages:
-    - frame_extract
+    # - frame_extract
     - colmap
     - gaussian_splatting
-    - ply_to_splat
+    #- ply_to_splat

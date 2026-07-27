@@ -10,24 +10,8 @@ import cv2
 import torch
 import torch.nn.functional as F
 import math
-
-# 1. config default 수정 (iteration, learning rate 등)
-# 2. workspace 준비 (output 디렉토리 생성)
-# 3. COLMAP 결과 로드 (cameras, images, points3D)
-# 4. 가우시안 초기화 (포인트 클라우드 → 위치, 색상, 불투명도, 공분산)
-# 5. 학습 (5-5, 5-6은 반복 100회당 1번)
-## 5-1. SampleTraining
-## 5-2. Rasterize
-## 5-3. Loss
-## 5-4. Adam
-## 5-5. 공분산이 너무 크거나, 투명도가 너무 작은 가우시안 제거
-## 5-6. densification (분할/복제) - 가우시안이 너무 크거나, 작으면 성능 저하
-# 6. .ply 저장
-# 7. 결과 검증 (가우시안 수, 파일 크기 등)
-# 8. context 채우기 (ply 경로)
-
-# input: output/sfm/*/sparse/0 (cameras.bin, images.bin, points3D.bin)
-# output: output/reconstruction/*/point_cloud.ply
+from plyfile import PlyData, PlyElement
+from tqdm import tqdm
 
 """
 colmap
@@ -90,12 +74,15 @@ class GaussianSplatting(BaseStage):
 
     def __init__(self, config):
 
+        # tile rasterization
         self.iter = config["gaussian_splatting"]["iteration"]
         self.lr = config["gaussian_splatting"]["learning_rate"]
 
         self.near_plane = config["gaussian_splatting"]["near"]
         self.far_plane = config["gaussian_splatting"]["far"]
         self.tile_size = config["gaussian_splatting"]["tile_size"]
+
+        self.output_dir = config["data"]["ply_dir"]
 
     def run(self, context):
         print("[GaussianSplatting] 실행")
@@ -104,58 +91,73 @@ class GaussianSplatting(BaseStage):
         # data--> output/sfm/video_00*/sparse/0
         self.input_dir = context["sparse"] 
         self.image_dir = context["frames_dir"]
-
-    # 초기 가우시안 생성
-    # (x,y,z), scale, quaternion, alpha, color 
-    def init_gaussian(self, point3D):
         
-        xyz = np.array([p.xyz for p in point3D.values()])     # (N, 3) float64
-        rgb = np.array([p.color for p in point3D.values()])   # (N, 3) uint8
-        N = xyz.shape[0]
+        self.train()
+        self.make_context(context)
 
-        # scale 
-        tree = KDTree(xyz)
-        dist, _ = tree.query(xyz, k=4)
-        scale = dist[:, 1:].mean(axis=1, keepdims=True).repeat(3, axis=1) 
 
-        # quaternion
-        q = np.zeros((N, 4))
-        q[:, 0] = 1.0
+    def save_ply(self, gaussians, video_idx):
+        path = f"{self.output_dir}/video_{video_idx}/point_cloud.ply"
+        os.makedirs(os.path.dirname(path), exist_ok=True)
 
-        # alpha 
-        alpha = np.full((N, 1), 0.5)
+        g = gaussians.detach().cpu().numpy()
+        N = g.shape[0]
 
-        # color
-        # pycolmap의 color 범위 0~255, gaussian 학습 범위는 0~1
-        f_dc = (rgb / 255.0 - 0.5) / 0.28209 
-        f_rest = np.zeros((N, 45))
+        # ply file header
+        # 고정 포맷 - 바이트 단위로 구조가 정해져 있어서 누가 만들어도 똑같이 생긴 포맷
+        # 컨테이너 포맷 - 읽는 규칙만 정해져 있고, 내용은 사용자가 자유롭게 정의
+        """
+        ply
+        format binary_little_endian 1.0
+        element vertex 1087406
+        property float [field]
+        ...
+        end_header
+        """
+        header = ['x', 'y', 'z', 'nx', 'ny', 'nz']
+        header += [f"f_dc_{i}" for i in range(3)]
+        header += [f"f_rest_{i}" for i in range(45)]
+        header += ["opacity"]
+        header += [f"scale_{i}" for i in range(3)]
+        header += [f"rot_{i}" for i in range(4)] # quaternion
 
-        # gaussian
-        gaussians = np.concatenate([xyz, scale, q, alpha, f_dc, f_rest], axis=1) # 위치, 크기, 회전, 투명도, 기본 색상, 색상 종류 [N, 59]
-        gaussians = torch.tensor(gaussians, dtype=torch.float32).cuda()
-        gaussians.requires_grad_(True)
+        normals = np.zeros((N, 3), dtype=g.dtype)
+        g = np.concatenate([g[:, :3], normals, g[:, 3:]], axis=1)
+        g = np.ascontiguousarray(g) 
+
+        header_type = [(name, 'f4') for name in header]
+        elements = g.view(header_type).reshape(N)
+
+        ply_el = PlyElement.describe(elements, 'vertex')
+        PlyData([ply_el]).write(path)
         
-        return gaussians
-
     # 학습
     def train(self):
 
         video_dirs = sorted(glob.glob(f"{self.input_dir}/*/sparse/0"))
 
-        for video_idx, video_dir in enumerate(video_dirs):
-            recon = pycolmap.Reconstruction(video_dir)
+        for video_idx, video_dir in tqdm(enumerate(video_dirs), total=len(video_dirs), desc="Videos"):
+            recon = pycolmap.Reconstruction(video_dir) # type: ignore
             image_ids = sorted(recon.images.keys())
 
             gaussians = self.init_gaussian(recon.points3D)
             optimizer = torch.optim.Adam([gaussians], lr=self.lr)
 
-            for _ in range(self.iter):
-                
+            # COLMAP sparse 포인트 수가 너무 적으면 SfM 자체가 실패한 것
+            print(f"init images: {len(image_ids)}, gaussians: {gaussians.shape[0]}")
+            
+
+            for iter in tqdm(range(self.iter), desc=f"video_{video_idx:03d}", leave=False):
+
                 # 랜덤 샘플링
                 learn_id = random.choice(image_ids)
                 image = recon.images[learn_id]
                 camera = recon.cameras[image.camera_id]
-                
+
+                # 카메라 모델에 따라 params 구조가 달라서 투영행렬이 틀려질 수 있음
+                if iter == 0:
+                    print(f"[camera] model: {camera.model_name}, params: {camera.params}")
+
                 # gt
                 gt = cv2.imread(f"{self.image_dir}/video_{video_idx:03d}/{image.name}")
                 gt = cv2.cvtColor(gt, cv2.COLOR_BGR2RGB)
@@ -168,8 +170,15 @@ class GaussianSplatting(BaseStage):
                 # Tile Rasterization
                 out = self.tile_rasterization(gaussians, V, P, cam_data)
 
+                # max가 0이면 렌더링 결과가 검은 화면 → loss가 GT 평균에 고정되는 원인
+                if iter == 0:
+                    print(f"[render] out min={out.min().item():.4f}, max={out.max().item():.4f}")
+
                 # Loss
                 loss = torch.abs(out - gt).mean()
+                loss_sum += loss.item()
+                avg_loss = loss_sum / (iter + 1)
+                print(f"iteration: {iter} loss : {loss.item():.4f} avg: {avg_loss:.4f}")
 
                 # Adam
                 loss.backward()
@@ -177,7 +186,42 @@ class GaussianSplatting(BaseStage):
                 optimizer.zero_grad()
                 
                 # Gaussian Refinement
+            
+            self.save_ply(gaussians, video_idx)
 
+    # 초기 가우시안 생성
+    # PLY 표준 순서: xyz, f_dc, f_rest, opacity, scale, rotation
+    def init_gaussian(self, point3D):
+
+        xyz = np.array([p.xyz for p in point3D.values()])     # (N, 3) float64
+        rgb = np.array([p.color for p in point3D.values()])   # (N, 3) uint8
+        N = xyz.shape[0]
+
+        # color (SH DC + rest)
+        # pycolmap의 color 범위 0~255, gaussian 학습 범위는 0~1
+        f_dc = (rgb / 255.0 - 0.5) / 0.28209
+        f_rest = np.zeros((N, 45))
+
+        # alpha (opacity, sigmoid 적용 전 raw)
+        alpha = np.full((N, 1), 0.5)
+
+        # scale (exp 적용 전 raw)
+        tree = KDTree(xyz)
+        dist, _ = tree.query(xyz, k=4)
+        scale = dist[:, 1:].mean(axis=1, keepdims=True).repeat(3, axis=1)
+        scale = np.log(scale)
+
+        # quaternion (rotation, normalize 전)
+        q = np.zeros((N, 4))
+        q[:, 0] = 1.0
+
+        # gaussian — PLY 표준 순서 [xyz | f_dc | f_rest | opacity | scale | rot] = [3+3+45+1+3+4 = 59]
+        gaussians = np.concatenate([xyz, f_dc, f_rest, alpha, scale, q], axis=1)
+        gaussians = torch.tensor(gaussians, dtype=torch.float32).cuda()
+        gaussians.requires_grad_(True)
+        
+        return gaussians
+    
     def tile_rasterization(self, gaussians, view, proj, cam_data):
 
         ### 1. Cull Gaussian
@@ -209,6 +253,12 @@ class GaussianSplatting(BaseStage):
         gaussians = gaussians[in_frustum]
         cam_xyz = cam_xyz[in_frustum]
 
+        # 0이면 카메라 행렬이 잘못돼서 가우시안이 전부 화면 밖에 있는 것
+        if gaussians.shape[0] == 0:
+            print("[cull] WARNING: 모든 가우시안이 culling됨")
+        else:
+            print(f"[cull] {gaussians.shape[0]} / {N} gaussians survived")
+
         ### 2. Screen space
         
         ## 카메라 좌표 > Projection > divide w > NDC > 픽셀 좌표
@@ -219,8 +269,8 @@ class GaussianSplatting(BaseStage):
         depth = cam_xyz[:,2]
 
         ## cov 3d > cov 2d
-        S = gaussians[:, 3:6]
-        Q = gaussians[:, 6:10]
+        S = torch.exp(gaussians[:, 52:55])
+        Q = gaussians[:, 55:59]
         
         S = torch.diag_embed(S) # N' X 3 X 3
         R = self.q2rot(Q) # N' X 3 X 3
@@ -248,17 +298,17 @@ class GaussianSplatting(BaseStage):
         ], dim=-2)
 
         # 변수 정리
-        opacity = torch.sigmoid(gaussians[:, 10]) #  alpha
+        opacity = torch.sigmoid(gaussians[:, 51]) #  alpha
         mu = torch.stack([pixel_x, pixel_y], dim=-1) # mean
         
         # SH
-        f_dc = gaussians[:, 11:14].view(-1, 1, 3) # [N', 3] --> [N', 1, 3]
-        f_rest = gaussians[:, 14:59].view(-1, 15, 3) # [N', 3] --> [N', 15, 3]
+        f_dc = gaussians[:, 3:6].view(-1, 1, 3) # [N', 3] --> [N', 1, 3]
+        f_rest = gaussians[:, 6:51].view(-1, 15, 3) # [N', 3] --> [N', 15, 3]
         sh = torch.cat([f_dc, f_rest], dim=1) # [N', 16, 3]
 
         # camera pos, direction
         cam_pos = -view[:3, :3].T @ view[:3, 3] # [3,]
-        dir = xyz - cam_pos[None, :] # [N', 3]
+        dir = gaussians[:, :3]  - cam_pos[None, :] # [N', 3]
         dir = F.normalize(dir, dim=-1)
 
         color = self.eval_sh(sh, dir)
@@ -418,8 +468,8 @@ class GaussianSplatting(BaseStage):
         return rot
     
     def build_view(self, image):
-        R = self.q2rot(torch.tensor(image.qvec, dtype=torch.float32, device='cuda').unsqueeze(0))[0]
-        T = torch.tensor(image.tvec, dtype=torch.float32, device='cuda')
+        R = torch.tensor(image.cam_from_world().rotation.matrix(), dtype=torch.float32, device='cuda')
+        T = torch.tensor(image.cam_from_world().translation, dtype=torch.float32, device='cuda')
         
         V = torch.eye(4, dtype=torch.float32, device='cuda')
         V[:3, :3] = R
@@ -441,5 +491,7 @@ class GaussianSplatting(BaseStage):
 
         return P, [fx, fy, cx, cy, camera_w, camera_h]
 
+    def make_context(self, context):
+        context["ply_dir"] = self.output_dir
     
         
