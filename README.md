@@ -2,6 +2,8 @@
 
 동영상 입력 → 3D Gaussian Splatting(.splat) 파일 출력 파이프라인
 
+> 코드 구조·설계 방향(연구/프로덕션 분리, 재구성 계획)은 [ARCHITECTURE.md](ARCHITECTURE.md) 참조
+
 ---
 
 ## 파이프라인 흐름
@@ -26,52 +28,16 @@ python main.py --recipe colmap_3dgs
 
 ```
 AURA-reconstruction/
-├── main.py
+├── main.py             # 진입점: recipe 이름을 받아 Orchestrator 호출
 ├── aura/
-│   ├── pipeline/
-│   │   ├── orchestrator.py
-│   │   └── stages.py
-│   └── stages/
-│       ├── base.py
-│       ├── preprocess/
-│       ├── sfm/
-│       ├── reconstruction/
-│       └── postprocess/
-├── recipes/
-│   └── recipes.yaml
-├── config/
-│   └── default.yaml
-└── data/
+│   ├── pipeline/       # orchestrator(실행) · stages(이름 → 클래스 매핑)
+│   └── stages/         # 처리 단계 구현체 (preprocess · sfm · reconstruction · postprocess)
+├── recipes/            # 파이프라인 조합 정의 (yaml)
+├── config/             # 경로 · 파라미터 설정값
+└── data/               # 입력 영상 (.mp4)
 ```
 
-### main.py
-- 파이프라인 진입점. recipe 이름을 받아 Orchestrator 호출
-
-### aura/pipeline/
-| 파일 | 역할 |
-|------|------|
-| orchestrator.py | config/recipes yaml 로딩 → Stage 순서대로 실행 |
-| stages.py | 문자열 이름 → 실제 Stage 클래스 매핑 |
-
-### aura/stages/
-각 처리 단계 구현체. 역할별 폴더 분리
-
-| 폴더/파일 | 역할 |
-|------|------|
-| base.py | Stage 인터페이스 (추상 클래스) |
-| preprocess/ | 영상 → 프레임 추출 + 품질 필터링 |
-| sfm/ | 카메라 파라미터 + 포인트 클라우드 생성 |
-| reconstruction/ | 3DGS 학습 → .ply 출력 |
-| postprocess/ | 포맷 변환 (.ply → .splat) |
-
-### recipes/
-- 파이프라인 조합 정의. 하나의 yaml에 여러 recipe를 키로 묶어 관리
-
-### config/
-- 경로, 파라미터 등 설정값
-
-### data/
-- 입력 영상 (.mp4)
+각 파일 역할·설계·목표 구조는 [ARCHITECTURE.md](ARCHITECTURE.md) 참조.
 
 ### output/ (자동 생성)
 ```
