@@ -1,0 +1,29 @@
+# 레시피 colmap_3dgs
+# frame_extract → colmap → gaussian_splatting → ply_to_splat
+#
+# conda 는 파이썬과 pip 만 설치한다.
+# 라이브러리를 conda 와 pip 이 나눠 설치하면 같은 패키지가 두 벌 생겨
+# 실행 중에 깨진다 (numpy · torch 조합에서 특히).
+
+name: colmap_3dgs
+
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu128
+
+      # 파이프라인 공통
+      - numpy==1.26.4
+      - opencv-python==4.8.1.78
+      - pyyaml==6.0.3
+
+      # train/gaussian_splatting.py
+      - torch==2.7.0
+      - scikit-learn==1.8.0
+      - plyfile==1.1.3
+      - tqdm==4.67.1
+
+      # COLMAP .bin 로드용
+      # (pose/colmap.py 는 CLI 바이너리를 호출하므로 파이썬 패키지 없음)
+      - pycolmap

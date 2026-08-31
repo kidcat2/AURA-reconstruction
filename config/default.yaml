@@ -1,23 +1,24 @@
+### folder
 data:
-  input_dir: "data"
-  frames_dir: "output/frames"
-  sfm_dir: "output/sfm"
-  reconstruction_dir: "output/reconstruction"
-  ply_dir: "output/ply"
+  scenes_dir: "data/scenes" # 결과물 자산 모음
+  scene: "input" # 입력 영상이 바뀌면 달라지는 값 (garden → lego)
+  run_dir: "runs/3dgs_org" # 실험이 바뀌면 달라지는 값 (3dgs_org → da3)
+
+### hyper-parameter ###
 
 #frame_extract
 frame_extract:
-  target_frames: 300
+  target_frames: 10
   blur_keep_ratio: 0.8
   blur_chunk_count: 10
   blur_min_per_chunk: 3
-  resize_long_side: 1600
+  resize_long_side: 640
   output_format: "jpg"
   jpg_quality: 95
 
 #gaussian
 gaussian_splatting:
-  iteration: 3000
+  iteration: 10
   learning_rate: 0.001
   near: 0.01
   far: 100.0

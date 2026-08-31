@@ -8,28 +8,47 @@ import sqlite3
 import struct
 import cv2
 
+"""
+colmap
+
+1) cameras.bin
+-- camera_id
+-- model (SIMPLE_PINHOLE, PINHOLE, SIMPLE_RADIAL 등)
+-- width, height
+-- params (fx, fy, cx, cy)
+
+2) images.bin
+-- image_id
+-- qvec (qw, qx, qy, qz)
+-- tvec (tx, ty, tz)
+-- camera_id
+-- name (이미지 파일명)
+-- xys (2D keypoint 좌표 배열)
+-- point3D_ids (각 keypoint에 대응하는 point3D id 배열)
+
+3) point3D.bin
+-- point3D_id
+-- xyz (x, y, z)
+-- rgb (r, g, b)
+-- error (재투영 오차)
+-- track (이 포인트를 관측한 image_id, point2D_idx 쌍의 배열)
+
+"""
+
 COLMAP_BIN = os.path.join(os.path.dirname(__file__), "../../../colmap/bin/colmap.exe")
-
-# 1. config default 수정 (quality preset 등)
-# 2. workspace 준비 (database, sparse 디렉토리 생성)
-# 3. pycolmap.extract_features 호출
-# 4. pycolmap.match_exhaustive 호출
-# 5. pycolmap.incremental_mapping 호출
-# 6. 결과 검증 (등록된 이미지 수, 포인트 수 확인)
-# 7. context 채우기 (카메라 파라미터, sparse model 경로)
-
-# input 파일 경로 : output/frames/*
-# output 파일 경로 : output/sfm/*
 
 class Colmap(BaseStage):
 
+    OUTPUT = "pose"
+
     def __init__(self, config):
-        self.output_dir = config["data"]["sfm_dir"]
+
+        self.output_dir = os.path.join(config["data"]["run_dir"], self.OUTPUT)
 
     def run(self, context):
         print("Colmap: start")
 
-        self.input_dir = context["frames_dir"]
+        self.input_dir = context["frames"]
 
         self.run_colmap()
         self.verify()
@@ -39,8 +58,14 @@ class Colmap(BaseStage):
 
     def run_colmap(self):
 
-        # self.input_dir = output/frames
-        # image paths = [video_001, video_002...]
+        """
+        1) 경고 : frame < 100 , resolution < 256
+        2) colmap : frame extractor → sequential matcher → mapper
+        3) 저장 : camears.bin, images.bin, points3D.bin
+            - 경로 : (config-default.yaml)
+        
+        """
+
         image_paths = sorted(glob.glob(f"{self.input_dir}/*"))
 
         print(f"Colmap: processing {len(image_paths)} videos")
@@ -53,16 +78,16 @@ class Colmap(BaseStage):
             frames = sorted(glob.glob(f"{image_path}/*"))
             flen = len(frames)
 
-            if  flen < 100 : 
+            if flen < 100 : 
                 print("Input Frames numbers under 150")
-                exit()
+                #exit()
 
             sample = cv2.imread(frames[0])
             h, w = sample.shape[:2]
             
             if h < 256 or w < 256:
                 print("Frame Resolution under 256")
-                exit()
+                #exit()
             ###
 
             output_dir = f"{self.output_dir}/video_{idx:03d}"
@@ -111,6 +136,12 @@ class Colmap(BaseStage):
 
     def verify(self):
 
+        """
+        1) 필수 파일 확인 : camears.bin, images.bin, points3D.bin
+        2) 경고 : 입력 프레임 수 - colmap 후 image 수 비교
+        
+        """
+
         # self.output_dir : output/sfm
         output_paths = sorted(glob.glob(f"{self.output_dir}/*"))
 
@@ -154,4 +185,4 @@ class Colmap(BaseStage):
         conn.close()
 
     def make_context(self, context):
-        context["sparse"] = self.output_dir
+        context["poses"] = self.output_dir

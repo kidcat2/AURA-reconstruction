@@ -72,7 +72,11 @@ SH_C3 = [
 
 class GaussianSplatting(BaseStage):
 
+    OUTPUT = "train"
+
     def __init__(self, config):
+
+        self.output_dir = os.path.join(config["data"]["run_dir"], self.OUTPUT)
 
         # tile rasterization
         self.iter = config["gaussian_splatting"]["iteration"]
@@ -82,16 +86,14 @@ class GaussianSplatting(BaseStage):
         self.far_plane = config["gaussian_splatting"]["far"]
         self.tile_size = config["gaussian_splatting"]["tile_size"]
 
-        self.output_dir = config["data"]["ply_dir"]
-
     def run(self, context):
         print("[GaussianSplatting] 실행")
 
         # input_dir : output/sfm
         # data--> output/sfm/video_00*/sparse/0
-        self.input_dir = context["sparse"] 
-        self.image_dir = context["frames_dir"]
-        
+        self.input_dir = context["poses"]
+        self.image_dir = context["frames"]
+
         self.train()
         self.make_context(context)
 
@@ -492,6 +494,6 @@ class GaussianSplatting(BaseStage):
         return P, [fx, fy, cx, cy, camera_w, camera_h]
 
     def make_context(self, context):
-        context["ply_dir"] = self.output_dir
+        context["gaussians"] = self.output_dir
     
         

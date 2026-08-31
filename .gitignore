@@ -8,8 +8,11 @@
 
 # COLMAP 실행파일
 colmap/
+
+# 입력 자산 · 실행 결과
 data/
-output/
+runs/
+jobs/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
